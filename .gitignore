@@ -21,3 +21,5 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+Paymob_DS_Assessment_PRD.md
+/data
