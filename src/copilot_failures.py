@@ -13,13 +13,14 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Try to import Google Generative AI SDK
+# Try to import the new Google GenAI SDK
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
     HAS_GEMINI = True
 except ImportError:
     HAS_GEMINI = False
-    logger.warning("google-generativeai package not installed. Running in mock mode.")
+    logger.warning("google-genai package not installed. Running in mock mode.")
 
 def detect_anomalous_merchants(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -107,18 +108,19 @@ def get_merchant_failure_context(merchant_id: str, df: pd.DataFrame) -> dict:
     }
 
 class GeminiCopilot:
-    def __init__(self, model_name: str = "gemini-1.5-flash"):
+    def __init__(self, model_name: str = "gemini-3-flash"):
         self.model_name = model_name
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.client_ready = False
+        self.client = None
         
         if HAS_GEMINI and self.api_key:
-            genai.configure(api_key=self.api_key)
+            self.client = genai.Client(api_key=self.api_key)
             self.client_ready = True
             logger.info("Gemini API Client configured successfully.")
         else:
             if not HAS_GEMINI:
-                logger.warning("google-generativeai library is missing. Running in simulator mode.")
+                logger.warning("google-genai library is missing. Running in simulator mode.")
             elif not self.api_key:
                 logger.warning("GEMINI_API_KEY environment variable not set. Running in simulator mode.")
 
@@ -126,6 +128,7 @@ class GeminiCopilot:
         """
         Calls the Gemini API to explain the merchant's failure pattern.
         Includes exponential backoff retry logic for rate-limit safety (429 errors).
+        Falls back through alternative models if the primary model is quota-exhausted.
         """
         system_prompt = (
             "You are a Senior Paymob Support & Integration Analyst. Your job is to analyze "
@@ -147,28 +150,62 @@ class GeminiCopilot:
         if not self.client_ready:
             return self._simulate_response(context)
 
-        # Retry logic with exponential backoff
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Calling Gemini API (Attempt {attempt+1}/{max_retries}) for merchant {context['merchant_id']}...")
-                
-                model = genai.GenerativeModel(
-                    model_name=self.model_name,
-                    system_instruction=system_prompt
-                )
-                
-                response = model.generate_content(user_content)
-                return response.text
-                
-            except Exception as e:
-                logger.error(f"API call failed: {e}")
-                if attempt < max_retries - 1:
-                    sleep_time = 2 ** (attempt + 1)
-                    logger.info(f"Retrying in {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    logger.warning("Max retries reached. Falling back to simulator mode.")
-                    return self._simulate_response(context)
+        # Model fallback chain: try primary model, then alternatives.
+        # Since 'gemini-3-flash' is not a direct API ID, map it to actual valid Gemini 3 Flash IDs.
+        models_to_try = []
+        if self.model_name == "gemini-3-flash":
+            models_to_try.extend(["gemini-3-flash-preview"])
+        else:
+            models_to_try.append(self.model_name)
+
+        # Add robust alternative fallbacks
+        models_to_try.extend(["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash"])
+
+        # Deduplicate while preserving order
+        seen = set()
+        models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
+
+
+        for model_name in models_to_try:
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"Calling Gemini API model={model_name} (Attempt {attempt+1}/{max_retries}) for merchant {context['merchant_id']}...")
+                    
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=user_content,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                        )
+                    )
+                    
+                    return response.text
+                    
+                except Exception as e:
+                    error_str = str(e)
+                    logger.error(f"API call failed: {e}")
+                    
+                    # If quota exhausted, try next model immediately
+                    if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str:
+                        if attempt < max_retries - 1:
+                            # Use longer backoff for rate limits (Google suggests ~39s)
+                            sleep_time = min(40, 10 * (attempt + 1))
+                            logger.info(f"Rate limited. Retrying in {sleep_time} seconds...")
+                            time.sleep(sleep_time)
+                        else:
+                            logger.warning(f"Model {model_name} quota exhausted after {max_retries} attempts. Trying next model...")
+                            break  # Break inner loop to try next model
+                    else:
+                        if attempt < max_retries - 1:
+                            sleep_time = 2 ** (attempt + 1)
+                            logger.info(f"Retrying in {sleep_time} seconds...")
+                            time.sleep(sleep_time)
+                        else:
+                            logger.warning(f"Max retries reached for model {model_name}.")
+                            break
+
+        logger.warning("All models exhausted. Falling back to simulator mode.")
+        return self._simulate_response(context)
 
     def _simulate_response(self, context: dict) -> str:
         """
